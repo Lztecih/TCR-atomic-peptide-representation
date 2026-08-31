@@ -1,0 +1,23 @@
+# ---- housekeeping ----
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints/
+node_modules/
+
+# ---- this repository tracks CODE ONLY ----
+# Prose, slides and generated artefacts are deliberately not tracked.
+
+# documentation / prose
+*.md
+
+# slides and talks
+*.pptx
+*.html
+
+# data: every loader in the code downloads its own inputs on first run
+data/
+
+# generated outputs: reproduce them by running the scripts
+results/
+figures/
