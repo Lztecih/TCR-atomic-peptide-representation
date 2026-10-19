@@ -1,0 +1,226 @@
+"""One Bayesian ordinal-logistic model; four distance forms.
+
+The shared skeleton, following BATMAN:
+
+    eta_i = d0[t(i)] - d_i            (+ pMHC bind-level offset)
+    activation_i ~ OrderedLogistic(eta_i, cutpoints)
+
+and the distance d_i is where the four arms differ:
+
+  'matrix'   d = sum_p w(p) * M[a_p, b_p]                      M fixed
+  'batman'   d = sum_p w(p) * D[a_p, b_p] * (1 + delta_q)      M learned (BATMAN)
+  'peptide'  d = || A (e(x) - e(y)) ||^2                       ROUTE B
+  'feature'  d = sum_p w(p) * m_p * (g0 + gamma . x_p)         ROUTE C
+
+Priors: w(p) ~ Beta(alpha,beta) with alpha,beta ~ Gamma(2,2) when receptors are
+pooled, Beta(2,2) for a single-group fit; non-centred receptor intercepts, or
+Normal(0,2) for a single group; Beta pMHC offsets; ordered Normal(0,2)
+cutpoints.
+
+Two numerical points that decide whether the feature arms run at all:
+  - ADVI with pymc's default optimiser diverges to NaN on the feature
+    parameterisation. adagrad_window at learning_rate 0.05 with the gradient
+    norm clipped at 10 fixes it; the clipping is what matters, not the step.
+  - with gamma ~ Normal(0, tau) over K standardised features, tau ~
+    HalfNormal(1) makes the implied prior on the substitution cost grow as
+    sqrt(K), so arms with different feature counts are not comparable and the
+    linear predictor can overflow. tau ~ HalfNormal(1/sqrt(K)) fixes the prior
+    on the function instead of on the coefficients.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pymc as pm
+import pytensor.tensor as pt
+
+from data import AAI
+
+BIND = ["NB", "WB", "SB"]
+
+
+def _onehot_pos(d, L):
+    m = np.zeros((len(d), L))
+    p = d.pos.to_numpy()
+    ok = p >= 0
+    m[np.arange(len(d))[ok], p[ok]] = 1.0
+    return m
+
+
+def fit_predict(train, test, *, mode="matrix", D=None,
+                X_train=None, X_test=None, E_train=None, E_test=None,
+                use_mhc=False, pooled=True, steps=40000, draws=3000,
+                seed=111, stable=True, g0_scale=2.0, rank=16,
+                return_posterior=False, C=None, cdr3_scale=0.5):
+    """Fit on `train`, return the posterior-mean distance for each row of `test`.
+
+    return_posterior=True additionally returns a dict of posterior means for the
+    fitted parameters, so a caller can score peptides the model graph never saw
+    -- in particular multi-residue mutants, where the distance is a sum over
+    several substituted positions instead of one. The default path is unchanged.
+    """
+    L = int(train.index_peptide.str.len().iloc[0])
+    assert (train.index_peptide.str.len() == L).all()
+    assert (test.index_peptide.str.len() == L).all()
+
+    names = sorted(set(train.tcr) | set(test.tcr))
+    tix = {t: i for i, t in enumerate(names)}
+    T = len(names)
+    tr_t = train.tcr.map(tix).to_numpy()
+    te_t = test.tcr.map(tix).to_numpy()
+    y = train.activation.to_numpy().astype(int)
+    Mtr, Mte = _onehot_pos(train, L), _onehot_pos(test, L)
+    sub_tr = Mtr.sum(axis=1)          # 1 for a substituted row, 0 for wild type
+    sub_te = Mte.sum(axis=1)
+
+    with pm.Model() as model:
+        single = (not pooled) or T == 1
+        if C is not None:
+            # RECEPTOR-CONDITIONED WEIGHTS.
+            #   logit w[t,p] = mu_p + C[t] . theta[:,p]
+            # mu_p is the pan-receptor profile and theta lets a receptor's own
+            # CDR3 descriptors tilt it. The point is leave-one-receptor-out: a
+            # receptor never seen has no learned weights of its own, and the
+            # population average is worth almost nothing (0.519 AUC). Its CDR3
+            # sequence, however, IS known, so this gives it a PREDICTED profile.
+            # theta is shrunk hard: with L*J coefficients on a handful of
+            # distinct receptors it would otherwise just memorise them.
+            J = C.shape[1]
+            mu_p = pm.Normal("mu_p", 0.0, 1.5, shape=L)
+            tau_th = pm.HalfNormal("tau_theta", cdr3_scale)
+            theta = pm.Normal("theta", 0.0, tau_th, shape=(J, L))
+            w = pm.Deterministic("w", pm.math.sigmoid(mu_p[None, :] + pt.dot(C, theta)))
+            d0 = pm.Normal("d0", 0.0, 2.0, shape=T)
+        elif single:
+            w = pm.Beta("w", 2.0, 2.0, shape=(T, L))
+            d0 = pm.Normal("d0", 0.0, 2.0, shape=T)
+        else:
+            aw = pm.Gamma("alpha_w", alpha=2, beta=2)
+            bw = pm.Gamma("beta_w", alpha=2, beta=2)
+            w = pm.Beta("w", alpha=aw, beta=bw, shape=(T, L))
+            mub = pm.Normal("mu_bar", 0.0, 2.0)
+            sdb = pm.HalfNormal("sigma_bar", 2.0)
+            z = pm.Normal("z", 0.0, 1.0, shape=T)
+            d0 = pm.Deterministic("d0", mub + sdb * z)
+
+        w_tr = (w[tr_t] * Mtr).sum(axis=1)
+        w_te = (w[te_t] * Mte).sum(axis=1)
+
+        if mode == "peptide":
+            # ROUTE B. A single scalar norm of a 1024-dim difference throws away
+            # almost everything, so the metric itself is learned: a low-rank
+            # Mahalanobis form d = ||A dz||^2 with A of shape (rank, dim).
+            K = E_train.shape[1]
+            A = pm.Normal("A", 0.0, 1.0 / np.sqrt(K), shape=(rank, K))
+            s = pm.HalfNormal("scale", 2.0)
+            d_tr = s * (pt.dot(E_train, A.T) ** 2).sum(axis=1)
+            d_te = s * (pt.dot(E_test, A.T) ** 2).sum(axis=1)
+        elif mode == "feature":
+            K = X_train.shape[1]
+            g0 = pm.HalfNormal("g0", g0_scale)
+            tau = pm.HalfNormal("tau", 1.0 / np.sqrt(K))
+            gam = pm.Normal("gamma", 0.0, tau, shape=K)
+            d_tr = w_tr * sub_tr * (g0 + pt.dot(X_train, gam))
+            d_te = w_te * sub_te * (g0 + pt.dot(X_test, gam))
+
+        elif mode == "feature_matrix":
+            # A x C, STRUCTURAL form. The baseline cost stops being a constant
+            # and becomes the substitution matrix itself:
+            #     d = sum_p w(p) m_p ( g0 * D[a_p,b_p] + gamma . x_p )
+            # Unlike appending D as a feature column, the model cannot shrink
+            # the matrix away -- it multiplies the whole per-position term. D is
+            # already scale-matched across candidates, and g0 > 0 carries the
+            # overall magnitude, so the two are not competing for scale.
+            K = X_train.shape[1]
+            g0 = pm.HalfNormal("g0", g0_scale)
+            tau = pm.HalfNormal("tau", 1.0 / np.sqrt(K))
+            gam = pm.Normal("gamma", 0.0, tau, shape=K)
+            ai = np.array([AAI[a] if a else 0 for a in train.wt])
+            bi = np.array([AAI[a] if a else 0 for a in train.mt])
+            aj = np.array([AAI[a] if a else 0 for a in test.wt])
+            bj = np.array([AAI[a] if a else 0 for a in test.mt])
+            Dtr_ = D[ai, bi] * sub_tr
+            Dte_ = D[aj, bj] * sub_te
+            d_tr = w_tr * (g0 * Dtr_ + sub_tr * pt.dot(X_train, gam))
+            d_te = w_te * (g0 * Dte_ + sub_te * pt.dot(X_test, gam))
+
+        elif mode == "feature_peptide":
+            # B x C. The per-position sum plus a WHOLE-PEPTIDE term:
+            #     d = sum_p w(p) m_p ( g0 + gamma . x_p )  +  beta . z
+            # z is an uncentred low-rank projection of the whole-peptide
+            # embedding difference, so z = 0 exactly when peptide == index and
+            # the self-distance stays zero. The whole-peptide term is NOT gated
+            # by w(p) or m_p: it is a property of the molecule, not of one
+            # position, and it is the only term in any arm here that can
+            # represent an interaction BETWEEN two positions. On single-amino-
+            # acid mutants it is close to collinear with the per-position term,
+            # so expect beta to be weakly identified; the test that separates
+            # them is multi-mutant peptides, not these folds.
+            K = X_train.shape[1]
+            g0 = pm.HalfNormal("g0", g0_scale)
+            tau = pm.HalfNormal("tau", 1.0 / np.sqrt(K))
+            gam = pm.Normal("gamma", 0.0, tau, shape=K)
+            J = E_train.shape[1]
+            tb = pm.HalfNormal("tau_b", 1.0 / np.sqrt(J))
+            beta = pm.Normal("beta", 0.0, tb, shape=J)
+            d_tr = w_tr * sub_tr * (g0 + pt.dot(X_train, gam)) + pt.dot(E_train, beta)
+            d_te = w_te * sub_te * (g0 + pt.dot(X_test, gam)) + pt.dot(E_test, beta)
+        else:
+            ai = np.array([AAI[a] if a else 0 for a in train.wt])
+            bi = np.array([AAI[a] if a else 0 for a in train.mt])
+            aj = np.array([AAI[a] if a else 0 for a in test.wt])
+            bj = np.array([AAI[a] if a else 0 for a in test.mt])
+            base_tr = D[ai, bi] * sub_tr
+            base_te = D[aj, bj] * sub_te
+            if mode == "batman":
+                keys = np.where(sub_tr > 0, 20 * ai + bi, -1)
+                uniq = sorted({int(k) for k in keys if k >= 0})
+                kmap = {k: i for i, k in enumerate(uniq)}
+                mu = pm.Normal("mu", 0.0, 0.5)
+                sg = pm.Exponential("sigma", 1.0)
+                delta = pm.Normal("delta", mu, sg, shape=len(uniq))
+                q_tr = np.array([kmap.get(int(k), -1) for k in keys])
+                keys_te = np.where(sub_te > 0, 20 * aj + bj, -1)
+                q_te = np.array([kmap.get(int(k), -1) for k in keys_te])
+
+                def mult(q):
+                    seen = q >= 0
+                    return pt.switch(pt.as_tensor(seen),
+                                     1.0 + delta[np.where(seen, q, 0)], 1.0 + mu)
+                d_tr = w_tr * base_tr * mult(q_tr)
+                d_te = w_te * base_te * mult(q_te)
+            else:
+                d_tr = w_tr * base_tr
+                d_te = w_te * base_te
+
+        if use_mhc:
+            aa = pm.Gamma("alpha_add", alpha=2, beta=2)
+            ba = pm.Gamma("beta_add", alpha=2, beta=2)
+            dm = pm.Beta("dMHC", alpha=aa, beta=ba, shape=(T, 3))
+            Btr = np.stack([(train.BindLevel == b).to_numpy(float) for b in BIND], 1)
+            Bte = np.stack([(test.BindLevel == b).to_numpy(float) for b in BIND], 1)
+            d_tr = d_tr + (dm[tr_t] * Btr).sum(axis=1)
+            d_te = d_te + (dm[te_t] * Bte).sum(axis=1)
+
+        pm.Deterministic("d_test", d_te)
+        c = pm.Normal("c", 0.0, 2.0, shape=2,
+                      transform=pm.distributions.transforms.ordered,
+                      initval=np.array([0.1, 0.5]))
+        pm.OrderedLogistic("obs", eta=d0[tr_t] - d_tr, cutpoints=c,
+                           observed=y, compute_p=False)
+
+        if stable:
+            approx = pm.fit(n=steps, method="advi", random_seed=seed,
+                            obj_optimizer=pm.adagrad_window(learning_rate=0.05),
+                            total_grad_norm_constraint=10.0, progressbar=False)
+        else:
+            approx = pm.fit(n=steps, method="advi", random_seed=seed,
+                            progressbar=False)
+        idata = approx.sample(draws, random_seed=seed)
+    d_out = idata.posterior["d_test"].mean(dim=("chain", "draw")).to_numpy()
+    if not return_posterior:
+        return d_out
+    post = {k: idata.posterior[k].mean(dim=("chain", "draw")).to_numpy()
+            for k in idata.posterior.data_vars if k != "d_test"}
+    post["_tcr_index"] = {t: i for i, t in enumerate(names)}
+    post["_L"] = L
+    return d_out, post

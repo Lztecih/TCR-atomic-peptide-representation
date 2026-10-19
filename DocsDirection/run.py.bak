@@ -1,0 +1,163 @@
+"""Run one arm over a panel and protocol, and write per-receptor AUCs.
+
+Arms:
+  matrix:<name>   fixed substitution matrix (blosum100 | hamming | peptideclm)
+  batman:<name>   BATMAN proper: M = D*(1+delta), delta learned per substitution
+  peptide         ROUTE B: learned low-rank metric on whole-peptide embeddings
+  feature:full    ROUTE C: 50 language-model + 24 descriptor coefficients
+  feature:plm     ROUTE C ablation, language model only (50)
+  feature:desc    ROUTE C ablation, descriptors only (24)
+
+Examples:
+  python src/run.py --arm matrix:blosum100 --lengths 9
+  python src/run.py --arm feature:full --lengths 9 --protocol loo
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import data as D        # noqa: E402
+import features as FT   # noqa: E402
+import matrices as MX   # noqa: E402
+import metric as MT     # noqa: E402
+import model as MD      # noqa: E402
+
+
+def run(arm, panel_name="one_per_index", protocol="within", lengths=None,
+        steps=40000, draws=3000, seed=111, use_mhc=False, emb="mtr_large",
+        kind="res", quiet=True, cdr3=False, partial_path=None):
+    df = D.load_batcave()
+    panel = D.one_per_index(df) if panel_name == "one_per_index" else D.eligible_panel(df)
+    groups = D.length_groups(df, panel)
+    if lengths:
+        groups = {L: g for L, g in groups.items() if L in lengths}
+    kindname, _, arg = arm.partition(":")
+
+    rows = []
+    for L, group in groups.items():
+        if len(group) < 2 and protocol == "loo":
+            continue
+        splits = (list(D.folds(df, group, L)) if protocol == "within"
+                  else list(D.leave_one_receptor_out(df, group, L)))
+        for tag, tr, te in splits:
+            t0 = time.time()
+            kw = dict(use_mhc=use_mhc, pooled=(protocol == "within"),
+                      steps=steps, draws=draws, seed=seed)
+            if cdr3:
+                names = sorted(set(tr.tcr) | set(te.tcr))
+                Cm, _ = FT.cdr3_features(
+                    pd.concat([tr, te]).assign(
+                        cdr3a=pd.concat([tr, te]).cdr3a,
+                        cdr3b=pd.concat([tr, te]).cdr3b), names)
+                kw["C"] = Cm
+            if kindname == "feature":
+                # combination arms:  full+mat = A x C soft,  full+pep = B x C
+                mats = None
+                if arg.endswith("+mat"):
+                    mats = [MX.peptideclm(df, tag=emb, kind=kind)[0],
+                            MX.reference("blosum100")]
+                base = arg.replace("+mat", "").replace("+pep", "")
+                # variants that attack the LOO overfitting:
+                #   nodidx  drop u_idx (the receptor fingerprint)
+                #   delta   keep only features of the CHANGE, not of either endpoint
+                #   q4/q8   same blocks, fewer PCA components
+                BLK = {"nodidx": ("u_mut", "diff", "scalar"),
+                       "delta": ("diff", "scalar")}
+                blocks = BLK.get(base, FT.PLM_BLOCKS)
+                qq = 4 if base == "q4" else (8 if base == "q8" else 16)
+                Xtr, Xte = FT.route_c(tr, te, tag=emb, kind=kind, q=qq,
+                                      use_plm=base != "desc",
+                                      use_desc=base != "plm",
+                                      mats=mats, blocks=blocks)
+                if arg.endswith("+pep"):
+                    Etr, Ete = FT.route_b(tr, te, tag=emb, center=False)
+                    dist = MD.fit_predict(tr, te, mode="feature_peptide",
+                                          X_train=Xtr, X_test=Xte,
+                                          E_train=Etr, E_test=Ete, **kw)
+                else:
+                    dist = MD.fit_predict(tr, te, mode="feature",
+                                          X_train=Xtr, X_test=Xte, **kw)
+            elif kindname == "featmat":
+                # A x C STRUCTURAL: matrix multiplies the per-position term
+                Mc = MX.peptideclm(df, tag=emb, kind=kind)[0]
+                Xtr, Xte = FT.route_c(tr, te, tag=emb, kind=kind)
+                dist = MD.fit_predict(tr, te, mode="feature_matrix", D=Mc,
+                                      X_train=Xtr, X_test=Xte, **kw)
+            elif kindname == "peptide":
+                Etr, Ete = FT.route_b(tr, te, tag=emb)
+                dist = MD.fit_predict(tr, te, mode="peptide", E_train=Etr, E_test=Ete, **kw)
+            else:
+                if arg.startswith("peptideclm"):
+                    # rebuild the matrix without the held-out receptor's index
+                    # peptide, so a LOO run never sees it
+                    excl = (set(te.index_peptide.unique())
+                            if protocol in ("loo", "gloo") else None)
+                    M = MX.peptideclm(df, tag=emb, kind=kind, exclude_index=excl)[0]
+                else:
+                    M = MX.reference(arg)
+                dist = MD.fit_predict(tr, te, mode=("batman" if kindname == "batman"
+                                                    else "matrix"), D=M, **kw)
+            te = te.assign(_d=dist)
+            for tcr, g in te.groupby("tcr"):
+                g = g[~g.is_wt]
+                if len(g) < 3:
+                    continue
+                m, pr = MT.three_pairwise(g.activation.to_numpy(), g._d.to_numpy())
+                if np.isfinite(m):
+                    rows.append(dict(arm=arm, protocol=protocol, L=L, split=str(tag),
+                                     tcr=tcr, n=len(g), auc=m,
+                                     WS=pr[0], NS=pr[1], NW=pr[2]))
+            if not quiet:
+                print(f"  [{arm}] L={L} split={tag} {time.time()-t0:.0f}s", flush=True)
+            # Write after every fold, not only when the whole arm finishes. A
+            # group-aware LOO arm is 15 fits of ~9,300 rows and can run for well
+            # over an hour; losing all of it because the machine had to be
+            # closed is avoidable for the cost of one small file write.
+            if partial_path and rows:
+                pd.DataFrame(rows).to_csv(partial_path, index=False)
+    return pd.DataFrame(rows)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--arm", required=True)
+    ap.add_argument("--panel", default="one_per_index",
+                    choices=["one_per_index", "eligible"])
+    ap.add_argument("--protocol", default="within", choices=["within", "loo", "gloo"])
+    ap.add_argument("--lengths", type=int, nargs="*", default=None)
+    ap.add_argument("--steps", type=int, default=40000)
+    ap.add_argument("--draws", type=int, default=3000)
+    ap.add_argument("--seed", type=int, default=111)
+    ap.add_argument("--emb", default="mtr_large")
+    ap.add_argument("--kind", default="res")
+    ap.add_argument("--mhc", action="store_true")
+    ap.add_argument("--cdr3", action="store_true",
+                    help="condition the positional weights on each receptor's CDR3")
+    ap.add_argument("--tag", default=None)
+    a = ap.parse_args()
+
+    tag0 = a.tag or (f"{a.arm.replace(':','-')}_{a.panel}_{a.protocol}"
+                     + (f"_L{''.join(map(str,a.lengths))}" if a.lengths else ""))
+    os.makedirs(D.RESULTS, exist_ok=True)
+    r = run(a.arm, a.panel, a.protocol, a.lengths, a.steps, a.draws, a.seed,
+            a.mhc, a.emb, a.kind, quiet=False, cdr3=a.cdr3,
+            partial_path=os.path.join(D.RESULTS, f"{tag0}.csv"))
+    per = MT.per_receptor(r)
+    print(f"\n=== {a.arm} | {a.panel} | {a.protocol} | L={a.lengths} | steps={a.steps} ===")
+    print(f"receptors {len(per)}   mean AUC {per.mean():.4f}   sd {per.std():.4f}")
+    os.makedirs(D.RESULTS, exist_ok=True)
+    tag = a.tag or (f"{a.arm.replace(':','-')}_{a.panel}_{a.protocol}"
+                    + (f"_L{''.join(map(str,a.lengths))}" if a.lengths else ""))
+    r.to_csv(os.path.join(D.RESULTS, f"{tag}.csv"), index=False)
+    print(f"[written] results/{tag}.csv")
+
+
+if __name__ == "__main__":
+    main()
